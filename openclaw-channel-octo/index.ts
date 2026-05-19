@@ -12,8 +12,6 @@ import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
 import { execFileSync } from "node:child_process";
 import { dmworkPlugin } from "./src/channel.js";
 import { setDmworkRuntime } from "./src/runtime.js";
-import { getGroupMdForPrompt } from "./src/group-md.js";
-import { pendingInboundContext } from "./src/inbound.js";
 import {
   inProcessConfigReader,
   runDoctorChecks,
@@ -262,27 +260,8 @@ const plugin: {
 
     console.log('[octo] registering before_prompt_build hook');
     api.on('before_prompt_build', (_event, ctx) => {
-      const sections: string[] = [];
-
-      // 1. Group/Thread MD — wrapped in [GROUP CONTEXT] block
-      const groupMdContent = getGroupMdForPrompt(ctx);
-      if (groupMdContent) {
-        sections.push(`[GROUP CONTEXT]\n${groupMdContent}\n[/GROUP CONTEXT]`);
-      }
-
-      // 2. Inbound context (member list + history) — outside [GROUP CONTEXT], keeps original format
-      const sessionKey = ctx.sessionKey;
-      if (sessionKey) {
-        const pending = pendingInboundContext.get(sessionKey);
-        if (pending) {
-          pendingInboundContext.delete(sessionKey);
-          if (pending.memberListPrefix) sections.push(pending.memberListPrefix);
-          if (pending.historyPrefix) sections.push(pending.historyPrefix);
-        }
-      }
-
-      if (sections.length === 0) return;
-      return { prependContext: sections.join('\n\n') };
+      // GROUP.md is now injected inline into user message body (buildGroupContextBody).
+      // This hook is preserved for future extensibility but no longer returns prependContext.
     });
   },
 };

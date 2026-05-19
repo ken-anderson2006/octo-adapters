@@ -104,18 +104,6 @@ function getOrCreateHistoryMap(accountId: string): Map<string, any[]> {
   return m;
 }
 
-// Track last answered inbound message_seq per session for history segmentation.
-// Stores the message_seq of the @mention message that triggered the bot's last reply,
-// NOT the bot's own reply message_seq (sendMessage API returns 0 for that).
-const _lastBotReplySeq = new Map<string, Map<string, number>>();
-function getOrCreateLastBotReplySeqMap(accountId: string): Map<string, number> {
-  let m = _lastBotReplySeq.get(accountId);
-  if (!m) {
-    m = new Map<string, number>();
-    _lastBotReplySeq.set(accountId, m);
-  }
-  return m;
-}
 
 const _inboundQueues = new Map<string, Promise<void>>();
 
@@ -258,7 +246,6 @@ function cleanupStaleCaches(): void {
     for (const [groupId, lastAccess] of activityMap) {
       if (lastAccess < cutoff) {
         _historyMaps.get(accountId)?.delete(groupId);
-        _lastBotReplySeq.get(accountId)?.delete(groupId);
         _memberMaps.get(accountId)?.delete(groupId);
         // Note: uidToNameMap is a flat uid→name map (not keyed by groupId),
         // so we don't delete from it here — names remain valid across groups.
@@ -887,9 +874,6 @@ export const dmworkPlugin: ChannelPlugin<ResolvedDmworkAccount> = {
       // 4. Group history map — persists across auto-restarts (module-level)
       const groupHistories = getOrCreateHistoryMap(account.accountId);
 
-      // 4a. Last bot reply seq map — for history segmentation
-      const lastBotReplySeqMap = getOrCreateLastBotReplySeqMap(account.accountId);
-
       // 4b. Member name->uid map — for resolving @mentions in replies
       const memberMap = getOrCreateMemberMap(account.accountId);
 
@@ -973,7 +957,6 @@ export const dmworkPlugin: ChannelPlugin<ResolvedDmworkAccount> = {
                 message: msg,
                 botUid: credentials.robot_id,
                 groupHistories,
-                lastBotReplySeqMap,
                 memberMap,
                 uidToNameMap,
                 groupCacheTimestamps,

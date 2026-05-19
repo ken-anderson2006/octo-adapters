@@ -25,9 +25,150 @@ import { mkdir, unlink, readdir, stat } from "node:fs/promises";
 import { join, basename } from "node:path";
 import { randomUUID } from "node:crypto";
 
-// Pending inbound context for before_prompt_build hook injection.
-// handleInboundMessage writes here; the hook reads and clears per sessionKey.
-export const pendingInboundContext = new Map<string, { historyPrefix: string; memberListPrefix: string }>();
+import { getGroupMembersFromCache } from "./member-cache.js";
+import { readGroupMdFromDisk, readThreadMdFromDisk, getOrCreateGroupMdCache } from "./group-md.js";
+
+const VISIBLE_REPLY_TYPES: ReadonlySet<number> = new Set([
+  MessageType.Text,
+  MessageType.Image,
+  MessageType.GIF,
+  MessageType.Voice,
+  MessageType.Video,
+  MessageType.File,
+]);
+
+const injectedMessageIds = new Map<string, Set<string>>();
+
+export interface GroupHistoryEntry {
+  sender: string;
+  body: string;
+  mention?: MentionPayload;
+  mediaUrl?: string;
+  msgType?: number;
+  timestamp: number;
+  message_id?: string;
+  message_seq?: number;
+}
+
+const MARKER_PATTERNS = [
+  /^\[GROUP CONTEXT\]/,
+  /^\[\/GROUP CONTEXT\]/,
+  /^\[Group Members\]/,
+  /^\[Group Info\]/,
+  /^\[Chat messages since your last reply/,
+  /^\[Current message/,
+  /^\[sender:/,
+];
+
+export function sanitizeMarkers(content: string): string {
+  return content.split('\n').map(line => {
+    const trimmed = line.trimStart();
+    for (const pattern of MARKER_PATTERNS) {
+      if (pattern.test(trimmed)) {
+        return line.replace('[', '​[');
+      }
+    }
+    return line;
+  }).join('\n');
+}
+
+export function truncateBytes(content: string, maxBytes: number): string {
+  const buf = Buffer.from(content, 'utf8');
+  if (buf.length <= maxBytes) return content;
+  let end = maxBytes;
+  while (end > 0 && (buf[end] & 0xC0) === 0x80) end--;
+  return buf.subarray(0, end).toString('utf8') + '\n[...truncated]';
+}
+
+export function buildGroupContextBody(params: {
+  groupMdContent: string | null;
+  memberListPrefix: string;
+  historyEntries: GroupHistoryEntry[];
+  currentBody: string;
+  uidToNameMap: Map<string, string>;
+  memberMap: Map<string, string>;
+  sessionId: string;
+  accountId: string;
+  historyPromptTemplate?: string;
+}): string {
+  const sections: string[] = [];
+
+  if (params.groupMdContent) {
+    const sanitized = sanitizeMarkers(params.groupMdContent);
+    const truncated = truncateBytes(sanitized, 5120);
+    sections.push(`[GROUP CONTEXT]\n${truncated}\n[/GROUP CONTEXT]`);
+  }
+
+  if (params.memberListPrefix) {
+    sections.push(params.memberListPrefix.trimEnd());
+  }
+
+  if (params.historyEntries.length > 0) {
+    const injectedKey = `${params.accountId}:${params.sessionId}`;
+    const alreadyInjected = injectedMessageIds.get(injectedKey) ?? new Set();
+    const deduped = params.historyEntries.filter(
+      e => !e.message_id || !alreadyInjected.has(e.message_id)
+    );
+
+    if (deduped.length > 0) {
+      const historyLines = deduped.map(e => {
+        const senderLabel = buildSenderPrefix(e.sender, params.uidToNameMap);
+        let bodyForLLM = e.mention
+          ? convertContentForLLM(e.body, e.mention, params.memberMap)
+          : e.body;
+        bodyForLLM = sanitizeMarkers(bodyForLLM);
+        const line = `[sender: ${senderLabel}] ${bodyForLLM}`;
+        return e.mediaUrl ? `${line}\n  [media: ${e.mediaUrl}]` : line;
+      });
+
+      if (params.historyPromptTemplate) {
+        const messagesJson = JSON.stringify(
+          deduped.map(e => ({ sender: e.sender, body: e.body })),
+          null,
+          2,
+        );
+        const rendered = params.historyPromptTemplate
+          .replace("{messages}", messagesJson)
+          .replace("{count}", String(deduped.length));
+        sections.push(rendered.trimEnd());
+      } else {
+        sections.push(
+          `[Chat messages since your last reply - for context]\n${historyLines.join('\n')}`
+        );
+      }
+
+      const newInjectedSet = new Set(alreadyInjected);
+      for (const e of deduped) {
+        if (e.message_id) newInjectedSet.add(e.message_id);
+      }
+      injectedMessageIds.set(injectedKey, newInjectedSet);
+    }
+  }
+
+  sections.push(`[Current message - respond to this]\n${params.currentBody}`);
+
+  return sections.join('\n\n');
+}
+
+function resolveGroupMdContent(params: {
+  groupMdCache?: Map<string, { content: string; version: number }>;
+  accountId: string;
+  groupNo: string;
+  threadShortId?: string;
+}): string | null {
+  const { groupMdCache, accountId, groupNo, threadShortId } = params;
+
+  if (threadShortId) {
+    return readThreadMdFromDisk(accountId, groupNo, threadShortId);
+  }
+
+  if (groupMdCache) {
+    const cached = groupMdCache.get(groupNo);
+    if (cached?.content) return cached.content;
+  }
+
+  return readGroupMdFromDisk(accountId, groupNo);
+}
 
 export type DmworkStatusSink = (patch: {
   lastInboundAt?: number;
@@ -929,31 +1070,12 @@ export function resolveCommandAuthorized(isGroup: boolean, isOwnerUser: boolean,
   return !isGroup || (isOwnerUser && isExplicitBotMention);
 }
 
-export function segmentHistoryEntries(params: {
-  entries: Array<{ message_id?: string; message_seq?: number; [key: string]: any }>;
-  cutoffSeq: number;
-  currentMsgId?: string;
-}): { answered: typeof params.entries; new: typeof params.entries } {
-  const filtered = params.currentMsgId
-    ? params.entries.filter(e => e.message_id !== params.currentMsgId)
-    : params.entries;
-
-  if (params.cutoffSeq <= 0) {
-    return { answered: [], new: filtered };
-  }
-
-  return {
-    answered: filtered.filter(e => (e.message_seq ?? 0) <= params.cutoffSeq),
-    new: filtered.filter(e => (e.message_seq ?? 0) > params.cutoffSeq),
-  };
-}
 
 export async function handleInboundMessage(params: {
   account: ResolvedDmworkAccount;
   message: BotMessage;
   botUid: string;
   groupHistories: Map<string, any[]>;
-  lastBotReplySeqMap: Map<string, number>;
   memberMap: Map<string, string>;  // displayName -> uid mapping
   uidToNameMap: Map<string, string>;  // uid -> displayName mapping (reverse)
   groupCacheTimestamps: Map<string, number>;  // groupId -> lastFetchedAt
@@ -961,7 +1083,7 @@ export async function handleInboundMessage(params: {
   log?: ChannelLogSink;
   statusSink?: DmworkStatusSink;
 }) {
-  const { account, message, botUid, groupHistories, lastBotReplySeqMap, memberMap, uidToNameMap, groupCacheTimestamps, groupMdCache, log, statusSink } = params;
+  const { account, message, botUid, groupHistories, memberMap, uidToNameMap, groupCacheTimestamps, groupMdCache, log, statusSink } = params;
 
   // Detect GROUP.md update/delete notification — refresh both memory + disk cache, do NOT pass to LLM
   const earlyEventType = (message.payload as any)?.event?.type;
@@ -1183,7 +1305,6 @@ export async function handleInboundMessage(params: {
 
   // --- Mention gating for group messages ---
   const requireMention = account.config.requireMention !== false;
-  let historyPrefix = "";
 
   // Save original mention uids for reply (exclude bot itself)
   const originalMentionUids: string[] = (message.payload?.mention?.uids ?? []).filter((uid: string) => uid !== botUid);
@@ -1214,11 +1335,6 @@ export async function handleInboundMessage(params: {
       const botName = uidToNameMap.get(botUid);
       if (botName?.trim()) {
         const escaped = botName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-        // Lookbehind: more conservative than MENTION_PATTERN — also excludes CJK and extended
-        // Latin ranges so that adjacent Chinese text (e.g. '你好@BotName') is not a false
-        // positive.  Trade-off: '你好@BotName' without payload.mention is treated as non-mention;
-        // this is intentional — a false positive (spurious bot activation) is worse than a false
-        // negative (user simply re-sends with a space before @).
         const re = new RegExp(`(?<=^|[^\\w\\u4e00-\\u9fff\\u3040-\\u30FF\\uAC00-\\uD7AF\\u00C0-\\u024F])@${escaped}(?![\\w\\u4e00-\\u9fff\\u3040-\\u30FF\\uAC00-\\uD7AF\\u00C0-\\u024F.\\-])`);
         if (re.test(rawBody)) {
           isMentioned = true;
@@ -1228,6 +1344,9 @@ export async function handleInboundMessage(params: {
       }
     }
   }
+
+  // History entries for group context building (populated below when @mentioned)
+  let filteredHistory: GroupHistoryEntry[] = [];
 
   if (isGroup && requireMention) {
     // Debug: log received mention info
@@ -1259,24 +1378,21 @@ export async function handleInboundMessage(params: {
       return;
     }
 
-    // Bot IS mentioned — prepend history context (manual — avoids SDK format incompatibility)
-    // Sliding window: always include the most recent historyLimit messages
+    // Bot IS mentioned — build inline context
     const historyLimit = account.config.historyLimit ?? DEFAULT_GROUP_HISTORY_LIMIT;
     let entries = groupHistories.get(sessionId) ?? [];
-    // Take last N entries (sliding window)
     if (entries.length > historyLimit) {
       entries = entries.slice(-historyLimit);
-      groupHistories.set(sessionId, entries); // Persist trimmed array to prevent unbounded growth
+      groupHistories.set(sessionId, entries);
     }
-    const historyCountBefore = entries.length;
-    log?.info?.(`octo: [MENTION] 收到@消息 | 缓存=${historyCountBefore}条 | historyLimit=${historyLimit}`);
+    log?.info?.(`octo: [MENTION] 收到@消息 | 缓存=${entries.length}条 | historyLimit=${historyLimit}`);
 
     // If memory cache is empty or insufficient, try fetching from API
     const cacheInsufficient = entries.length < Math.ceil(historyLimit / 2);
     if (cacheInsufficient && account.config.botToken) {
       log?.info?.(`octo: [MENTION] 缓存不足(${entries.length}/${historyLimit})，从API补充历史...`);
       try {
-        const fetchLimit = Math.min(historyLimit, 100);  // Cap at 100
+        const fetchLimit = Math.min(historyLimit, 100);
         const apiMessages = await getChannelMessages({
           apiUrl: account.config.apiUrl,
           botToken: account.config.botToken,
@@ -1286,33 +1402,37 @@ export async function handleInboundMessage(params: {
           log,
         });
 
-        // Cold-start: derive initial cutoff from bot replies in API backfill
-        if ((lastBotReplySeqMap.get(sessionId) ?? 0) === 0 && apiMessages.length > 0) {
-          let inferredCutoff = 0;
-          for (const m of apiMessages) {
-            if (
-              m.from_uid === botUid &&
-              typeof m.message_seq === "number" &&
-              m.message_seq > inferredCutoff
-            ) {
-              inferredCutoff = m.message_seq;
-            }
-          }
-          if (inferredCutoff > 0) {
-            lastBotReplySeqMap.set(sessionId, inferredCutoff);
-            log?.info?.(
-              `octo: [MENTION] derived initial lastBotReplySeq=${inferredCutoff} from API backfill | session=${sessionId}`,
-            );
+        // Sort by message_seq ascending (API does not guarantee order)
+        const sorted = apiMessages.sort(
+          (a: any, b: any) => (a.message_seq ?? 0) - (b.message_seq ?? 0)
+        );
+
+        // Find Bot's last visible reply (position cutoff)
+        let lastBotReplyIndex = -1;
+        for (let i = sorted.length - 1; i >= 0; i--) {
+          const msgType = sorted[i].type;
+          if (
+            sorted[i].from_uid === botUid &&
+            typeof msgType === "number" &&
+            VISIBLE_REPLY_TYPES.has(msgType)
+          ) {
+            lastBotReplyIndex = i;
+            break;
           }
         }
 
-        const filteredApiMsgs = apiMessages
-          .filter((m: any) => m.from_uid !== botUid && (m.content || m.type !== 1))
-          .sort((a: any, b: any) => (a.message_seq ?? 0) - (b.message_seq ?? 0))
+        // Only take messages after Bot's last reply
+        const afterLastReply = lastBotReplyIndex >= 0
+          ? sorted.slice(lastBotReplyIndex + 1)
+          : sorted;
+
+        // Exclude Bot's own messages, filter empty Text, keep rest (including @Bot)
+        const backfillMsgs = afterLastReply
+          .filter((m: any) => m.from_uid !== botUid && (m.content || m.type !== MessageType.Text))
           .slice(-historyLimit);
-        entries = filteredApiMsgs.map((m: any) => {
+
+        entries = backfillMsgs.map((m: any) => {
           let body = m.content || resolveApiMessagePlaceholder(m.type, m.name);
-          // For MultipleForward, expand the nested messages from full payload
           if (m.type === MessageType.MultipleForward && m.payload) {
             body = resolveMultipleForwardText(m.payload, account.config.apiUrl, account.config.cdnUrl);
           }
@@ -1325,7 +1445,6 @@ export async function handleInboundMessage(params: {
             message_id: m.message_id,
             message_seq: m.message_seq,
           };
-          // For media message types, resolve the URL directly (storage is public-read)
           const mediaTypes = [MessageType.Image, MessageType.File, MessageType.Voice, MessageType.Video];
           if (mediaTypes.includes(m.type) && !m.content) {
             const apiResolved = resolveContent({ type: m.type, url: m.url, name: m.name } as any, account.config.apiUrl, log, account.config.cdnUrl);
@@ -1336,88 +1455,19 @@ export async function handleInboundMessage(params: {
           }
           return entry;
         });
-        log?.info?.(`octo: [MENTION] 从API获取到 ${entries.length} 条历史消息`);
+        log?.info?.(`octo: [MENTION] 从API获取到 ${entries.length} 条历史消息 (cutoff index=${lastBotReplyIndex})`);
       } catch (err) {
         log?.error?.(`octo: [MENTION] 从API获取历史失败: ${err}`);
       }
     }
 
-    // Build history context manually (JSON format)
-    // History media URLs are kept in the text body only — not passed as MediaUrls
-    // to Core (they are remote URLs; only local paths should go through MediaUrls)
-    if (entries.length > 0) {
-      const cutoffSeq = lastBotReplySeqMap.get(sessionId) ?? 0;
-      const currentMsgId = message.message_id;
+    // Filter out current message from history entries
+    const currentMsgId = message.message_id;
+    filteredHistory = currentMsgId
+      ? entries.filter((e: any) => e.message_id !== currentMsgId)
+      : entries;
 
-      const { answered: answeredEntries, new: newEntries } = segmentHistoryEntries({
-        entries,
-        cutoffSeq,
-        currentMsgId,
-      });
-
-      const formatEntries = (items: any[]) => JSON.stringify(items.map((e: any) => {
-        const bodyForLLM = e.mention
-          ? convertContentForLLM(e.body, e.mention, memberMap)
-          : e.body;
-        const senderLabel = buildSenderPrefix(e.sender, uidToNameMap);
-        return {
-          sender: senderLabel,
-          body: bodyForLLM,
-          ...(e.mediaUrl ? { mediaUrl: e.mediaUrl } : {}),
-        };
-      }), null, 2);
-
-      const ANSWERED_HEADER = "[Previous context - already answered, do NOT re-answer]";
-      const NEW_HEADER = "[Chat messages since your last reply - for context only, do NOT re-answer questions from this history]";
-      const CURRENT_HEADER = "[Current message - respond to this ONLY]";
-
-      let historyBlock = "";
-
-      if (answeredEntries.length > 0) {
-        historyBlock += `${ANSWERED_HEADER}\n\`\`\`json\n${formatEntries(answeredEntries)}\n\`\`\`\n\n`;
-      }
-      if (newEntries.length > 0) {
-        historyBlock += `${NEW_HEADER}\n\`\`\`json\n${formatEntries(newEntries)}\n\`\`\`\n\n`;
-      }
-
-      if (historyBlock) {
-        const template = account.config.historyPromptTemplate;
-        if (template) {
-          const hasSegmentedPlaceholders =
-            template.includes("{answered_messages}") ||
-            template.includes("{new_messages}");
-
-          if (hasSegmentedPlaceholders) {
-            historyPrefix = template
-              .replace("{answered_messages}", formatEntries(answeredEntries))
-              .replace("{new_messages}", formatEntries(newEntries))
-              .replace("{answered_count}", String(answeredEntries.length))
-              .replace("{new_count}", String(newEntries.length))
-              .replace("{messages}", formatEntries([...answeredEntries, ...newEntries]))
-              .replace("{count}", String(answeredEntries.length + newEntries.length));
-          } else {
-            const filteredEntries = entries.filter((e: any) => e.message_id !== currentMsgId);
-            const allFormatted = formatEntries(filteredEntries);
-            const legacyPreamble = answeredEntries.length > 0
-              ? `[Note: The first ${answeredEntries.length} message(s) below have already been answered. Do NOT re-answer them.]\n`
-              : "";
-            historyPrefix = legacyPreamble + template
-              .replace("{messages}", allFormatted)
-              .replace("{count}", String(filteredEntries.length));
-          }
-        } else {
-          historyPrefix = historyBlock + `${CURRENT_HEADER}\n\n`;
-        }
-        log?.info?.(`octo: [MENTION] 已注入历史上下文 | ${historyPrefix.length} chars | answered=${answeredEntries.length} new=${newEntries.length}`);
-      } else {
-        log?.info?.(`octo: [MENTION] 历史条目全部被过滤 | answered=${answeredEntries.length} new=${newEntries.length}`);
-      }
-    } else {
-      log?.info?.(`octo: [MENTION] 无历史上下文可注入`);
-    }
-
-    // History retained for context continuity; segmented by lastBotReplySeq at prompt build time
-    log?.info?.(`octo: [MENTION] 历史保留（按 message_seq 分段标注） | session=${sessionId}`);
+    log?.info?.(`octo: [MENTION] 历史上下文 ${filteredHistory.length} 条 | session=${sessionId}`);
   }
 
   const core = getDmworkRuntime();
@@ -1491,16 +1541,9 @@ export async function handleInboundMessage(params: {
     sessionKey: route.sessionKey,
   });
 
-  // memberListPrefix and historyPrefix are injected via before_prompt_build hook
-  // (not persisted to session history). Only quotePrefix stays in Body.
-  const memberListPrefix = isGroup ? buildMemberListPrefix(uidToNameMap) : "";
-  if (historyPrefix || memberListPrefix) {
-    pendingInboundContext.set(route.sessionKey, { historyPrefix, memberListPrefix });
-  }
-
   const finalBody = quotePrefix ? (quotePrefix + rawBody) : rawBody;
 
-  const body = core.channel.reply.formatAgentEnvelope({
+  const envelopeBody = core.channel.reply.formatAgentEnvelope({
     channel: "Octo",
     from: fromLabel,
     timestamp: message.timestamp ? message.timestamp * 1000 : undefined,
@@ -1509,7 +1552,63 @@ export async function handleInboundMessage(params: {
     body: finalBody,
   });
 
-  // GROUP.md injection is handled exclusively by the before_prompt_build hook
+  // Build full body: for groups, wrap envelope in group context (GROUP.md + members + history)
+  let body: string;
+  if (isGroup) {
+    const _parentGroupNo = extractParentGroupNo(message.channel_id!);
+    const _threadShortId = extractThreadShortId(message.channel_id!);
+
+    const groupMdContent = resolveGroupMdContent({
+      groupMdCache,
+      accountId: account.accountId,
+      groupNo: _parentGroupNo,
+      threadShortId: _threadShortId ?? undefined,
+    });
+
+    // Build scoped member list (only current group members)
+    let scopedUidToNameMap = new Map<string, string>();
+    try {
+      const currentGroupMembers = await getGroupMembersFromCache({
+        apiUrl: account.config.apiUrl,
+        botToken: account.config.botToken ?? "",
+        groupNo: _parentGroupNo,
+        log,
+      });
+      for (const m of currentGroupMembers) {
+        if (m.uid && m.name) {
+          scopedUidToNameMap.set(m.uid, m.name);
+        }
+      }
+    } catch (err) {
+      log?.warn?.(`octo: [MEMBERS] getGroupMembersFromCache failed, skipping member list: ${String(err)}`);
+      scopedUidToNameMap = new Map();
+    }
+
+    const memberListPrefix = buildMemberListPrefix(scopedUidToNameMap);
+
+    const historyTemplate = account.config.historyPromptTemplate;
+    if (historyTemplate && filteredHistory.length > 0) {
+      if (historyTemplate.includes("{answered_messages}") || historyTemplate.includes("{new_messages}")) {
+        log?.warn?.(
+          "octo: historyPromptTemplate contains deprecated {answered_messages}/{new_messages} placeholder — answered segment has been removed"
+        );
+      }
+    }
+
+    body = buildGroupContextBody({
+      groupMdContent,
+      memberListPrefix,
+      historyEntries: filteredHistory,
+      currentBody: envelopeBody,
+      uidToNameMap: scopedUidToNameMap,
+      memberMap,
+      sessionId,
+      accountId: account.accountId,
+      historyPromptTemplate: historyTemplate,
+    });
+  } else {
+    body = envelopeBody;
+  }
   // (see index.ts → getGroupMdForPrompt) — no longer set here to avoid duplication.
 
   // Resolve sender display name — async fallback for DM users not in cache
@@ -1609,6 +1708,7 @@ export async function handleInboundMessage(params: {
   const deliverBuffer = {
     lastText: null as string | null,
     textSent: false,
+    errorOccurred: false,
   };
   const sentMediaUrls = new Set<string>();
 
@@ -1786,6 +1886,7 @@ export async function handleInboundMessage(params: {
           log?.debug?.(`octo: [deliver-buffer] ${kind} text buffered (${content.length} chars)`);
         },
         onError: async (err: unknown, info: { kind: string }) => {
+          deliverBuffer.errorOccurred = true;
           clearInterval(typingInterval);
           log?.error?.(`octo ${info.kind} reply failed: ${String(err)}`);
           // Prevent finally block from sending stale buffered text after error
@@ -1805,34 +1906,33 @@ export async function handleInboundMessage(params: {
         },
       },
     });
+  } catch (dispatchErr) {
+    deliverBuffer.errorOccurred = true;
+    log?.error?.(`octo: dispatchReplyWithBufferedBlockDispatcher threw: ${String(dispatchErr)}`);
   } finally {
     // --- Final send: deliver buffered text if only blocks arrived (no final/tool) ---
+    let deliveryConfirmed = false;
+
     if (deliverBuffer.lastText && !deliverBuffer.textSent) {
       deliverBuffer.textSent = true;
       try {
         await resolveAndSendText(deliverBuffer.lastText);
-        replySucceeded = true;
+        deliveryConfirmed = true;
         log?.info?.(`octo: [deliver-buffer] fallback text sent (${deliverBuffer.lastText.length} chars)`);
       } catch (finalSendErr) {
         log?.error?.(`octo: [deliver-buffer] final text send failed: ${String(finalSendErr)}`);
       }
+    } else if (replySucceeded && !deliverBuffer.errorOccurred) {
+      deliveryConfirmed = true;
     }
-    clearInterval(typingInterval);
-    // Safety net: clean up pending inbound context in case the hook didn't fire
-    pendingInboundContext.delete(route.sessionKey);
 
-    // Record last answered inbound message_seq for history segmentation (don't clear history).
-    // We use the inbound @mention message's message_seq (from WebSocket frame) rather than
-    // sendMessage's returned message_seq, because the API always returns message_seq=0.
-    if (isGroup && replySucceeded) {
-      const seq = message.message_seq;
-      if (typeof seq === "number" && seq > 0) {
-        const existing = lastBotReplySeqMap.get(sessionId) ?? 0;
-        if (seq > existing) {
-          lastBotReplySeqMap.set(sessionId, seq);
-          log?.info?.(`octo: [HISTORY] Bot reply done, recorded lastAnsweredSeq=${seq} | session=${sessionId}`);
-        }
-      }
+    clearInterval(typingInterval);
+
+    // Clear history cache and injected message IDs on confirmed delivery
+    if (isGroup && deliveryConfirmed) {
+      groupHistories.delete(sessionId);
+      injectedMessageIds.delete(`${account.accountId}:${sessionId}`);
+      log?.info?.(`octo: [HISTORY] Reply delivered, cleared history cache | session=${sessionId}`);
     }
   }
 }
